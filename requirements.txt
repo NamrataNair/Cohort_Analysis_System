@@ -1,0 +1,9 @@
+streamlit
+pandas
+langchain
+langchain-community
+langchain-core
+langchain-chroma
+langchain-ollama
+openpyxl
+beautifulsoup4
