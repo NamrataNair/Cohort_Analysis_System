@@ -1,108 +1,149 @@
-#main_app.py
+"""Streamlit entry point for the Cohort Analysis System."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List
+
+import pandas as pd
 import streamlit as st
-from summarizer import summarizer 
-from chatbot import chatbot
+
+from rag_engine import NegationAwareRAG
+from ui_helpers import build_ready_made_queries, human_readable_size
+from user_vector_store import UserVectorStore
 
 
+st.set_page_config(page_title="LLM Cohort Copilot", layout="wide")
 
 
-
-st.set_page_config(page_title="Amrita HIS Patient Cohort Dashboard", layout="wide")
-st.sidebar.title("Cohort Insights Menu")
-page = st.sidebar.selectbox("Please select whether you want to explore or summarize patient cohorts:", ["Amrita HIS Patient Cohort Explorer","Amrita HIS Patient Cohort Summarizer"])
-
-if page == "Amrita HIS Patient Cohort Summarizer":
-    summarizer()
-
-elif page == "Amrita HIS Patient Cohort Explorer":
-    # Inject CSS for custom dialog styling and button text-like appearance
-    st.markdown(
-        """
-        <style>
-        /* Customize dialog size */
-        div[data-testid="stDialog"] div[role="dialog"]:has(.big-dialog) {
-            width: 80vw;
-            height: 80vh;
-            overflow: auto;
-        }
-
-        /* Base button style */
-        button[kind="primary"] {
-            width: 100%;
-            background-color: #ffffff;       /* clean white */
-            border: 2px solid #1e293b;       /* dark navy border */
-            border-radius: 0;            /* pill shape */
-            color: #1e293b;                   /* dark navy text */
-            font-family: "Basier circle", -apple-system, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
-            font-weight: 600 !important;
-            font-size: 0.6rem !important;
-            padding: 2px !important;
-            box-shadow: 0 1px 4px rgba(30, 41, 59, 0.25);
-            cursor: pointer;
-            transition: background-color 0.25s ease, color 0.25s ease, box-shadow 0.25s ease;
-            user-select: none;
-            text-align: center;
-            outline: none;
-        }
-
-        /* Hover effect */
-        button[kind="primary"]:hover {
-            background-color: #1e293b;       /* dark navy background */
-            color: #ffffff;                  /* white text */
-            box-shadow: 0 4px 12px rgba(30, 41, 59, 0.4);
-        }
-
-        /* Focus effect */
-        button[kind="primary"]:focus {
-            outline-offset: 2px;
-            box-shadow: none;
-        }
-
-        /* Active / pressed effect */
-        button[kind="primary"]:active {
-            background-color: #15213a;
-            box-shadow: 0 2px 6px rgba(21, 33, 58, 0.6);
-        }
+def _init_state() -> None:
+    if "store" not in st.session_state:
+        st.session_state.store = UserVectorStore()
+    if "rag" not in st.session_state:
+        st.session_state.rag = NegationAwareRAG(st.session_state.store)
+    if "messages" not in st.session_state:
+        st.session_state.messages: List[Dict[str, Any]] = []
+    if "pending_query" not in st.session_state:
+        st.session_state.pending_query = None
 
 
+def _render_sidebar() -> str:
+    st.sidebar.title("Cohort Controls")
+    user_id = st.sidebar.text_input("User / Workspace ID", help="All vector stores are isolated per user.")
 
-        
-        /* Download button style */
-        button[kind="secondary"] {
-            padding: 0px 10px !important;
-            font-size: 1rem !important;
-            border: solid 1px #15213a !important;
-            border-radius: 0 !important;
-        }
-        /* Hover */
-        button[kind="secondary"]:hover {
-            background-color: #15213a !important;
-            color: #ffffff !important;
-            box-shadow: 0 4px 12px rgba(30, 41, 59, 0.4);
-        }
+    if not user_id:
+        st.sidebar.info("Enter your workspace identifier to continue.")
+        return ""
 
-        /* Focus */
-        button[kind="secondary"]:focus {
-            outline-offset: 2px;
-            box-shadow: none;
-            color: black !important;
-        }
+    report = st.session_state.store.get_usage_report(user_id)
+    st.sidebar.metric(
+        "Storage usage",
+        human_readable_size(report["used_bytes"]),
+        help=f"Quota: {human_readable_size(report['quota_bytes'])} ({report['used_percent']}% used)",
+    )
+
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload cohort CSV", type=["csv"], help="Rows are embedded into a private vector index for this user only."
+    )
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            info = st.session_state.store.ingest_dataframe(user_id, df)
+            st.sidebar.success(
+                f"Ingested {info['rows']} rows into your personal vector database. The index persists on disk."
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(str(exc))
+
+    summary = st.session_state.store.load_dataset_summary(user_id)
+    if summary:
+        st.sidebar.subheader("Dataset snapshot")
+        st.sidebar.write(f"Rows embedded: **{summary['row_count']}**")
+        st.sidebar.caption(f"Columns: {', '.join(summary['columns'])}")
+
+    return user_id
 
 
-        /* Responsive font size for larger screens */
-        @media (min-width: 768px) {
-            button[kind="primary"] {
-                font-size: 1.25rem;
-                padding: 1rem 2.5rem;
-            }
-        }
+def _render_ready_queries(columns: List[str]) -> None:
+    st.subheader("Jump start your analysis")
+    suggestions = build_ready_made_queries(columns)
+    cols = st.columns(len(suggestions)) if suggestions else []
+    for idx, query in enumerate(suggestions):
+        button = cols[idx].button(query, use_container_width=True)
+        if button:
+            st.session_state.pending_query = query
 
 
+def _display_messages() -> None:
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                if message.get("follow_ups"):
+                    st.markdown("**Suggested questions**")
+                    follow_cols = st.columns(len(message["follow_ups"]))
+                    for idx, text in enumerate(message["follow_ups"]):
+                        if follow_cols[idx].button(text, key=f"follow_{len(st.session_state.messages)}_{idx}"):
+                            st.session_state.pending_query = text
+                if message.get("sources"):
+                    with st.expander("Sources from cohort dataset", expanded=False):
+                        st.dataframe(pd.DataFrame(message["sources"]))
 
-        </style>
-        """,
-            unsafe_allow_html=True,
-        )
 
-    chatbot()
-    
+def _ingest_sources(documents: List[Any]) -> List[Dict[str, Any]]:
+    sources = []
+    for doc in documents:
+        row_meta = {"row_index": doc.metadata.get("row_index"), "polarity": doc.metadata.get("polarity")}
+        row_json = doc.metadata.get("row_json")
+        if row_json:
+            try:
+                row_data = json.loads(row_json)
+                row_meta.update(row_data)
+            except json.JSONDecodeError:
+                row_meta["raw_row"] = row_json
+        sources.append(row_meta)
+    return sources
+
+
+def _handle_user_prompt(user_id: str, prompt: str) -> None:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    response = st.session_state.rag.answer_question(user_id, prompt)
+    sources = _ingest_sources(response["documents"])
+    assistant_message = {
+        "role": "assistant",
+        "content": response["answer"],
+        "sources": sources,
+        "follow_ups": response.get("follow_ups", []),
+    }
+    st.session_state.messages.append(assistant_message)
+
+
+def main() -> None:
+    _init_state()
+    st.title("Cohort Analysis Copilot")
+    st.caption("An Ollama powered, negation aware RAG workspace with personalised vector stores.")
+
+    user_id = _render_sidebar()
+    if not user_id:
+        return
+
+    summary = st.session_state.store.load_dataset_summary(user_id)
+    _render_ready_queries(summary.get("columns", []) if summary else [])
+
+    _display_messages()
+
+    pending = st.session_state.pending_query
+    if pending:
+        st.session_state.pending_query = None
+        _handle_user_prompt(user_id, pending)
+        st.experimental_rerun()
+
+    prompt = st.chat_input("Ask a cohort intelligence question…")
+    if prompt:
+        _handle_user_prompt(user_id, prompt)
+        st.experimental_rerun()
+
+
+if __name__ == "__main__":
+    main()
+
